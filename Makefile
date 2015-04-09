@@ -11,6 +11,7 @@ build:
 
 check:
 	go vet ${PKG}
+	golint ${PKG}
 
 clean:
 	rm -f ./${EXEC}
