@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -34,7 +35,7 @@ const (
 	ghRepoCollaborators = "repo_collaborators"
 )
 
-// GHTorrent structures for unmarshalling BSon.
+// GHTorrent structures for unmarshalling BSON.
 type (
 	// ghUser represents a GitHub user.
 	ghUser struct {
@@ -101,9 +102,64 @@ type (
 	}
 )
 
+// Tables fields
+var (
+	usersFields   = []string{"username", "name", "email"}
+	ghUsersFields = []string{
+		"user_id",
+		"github_id",
+		"login",
+		"bio",
+		"company",
+		"email",
+		"hireable",
+		"location",
+		"avatar_url",
+		"html_url",
+		"followers_count",
+		"following_count",
+		"created_at",
+		"updated_at",
+	}
+	ghOrgsFields = []string{
+		"login",
+		"github_id",
+		"avatar_url",
+		"html_url",
+		"name",
+		"company",
+		"location",
+		"email",
+		"created_at",
+		"updated_at",
+	}
+	reposFields   = []string{"name", "primary_language", "clone_url", "clone_path", "vcs"}
+	ghReposFields = []string{
+		"repository_id",
+		"full_name",
+		"description",
+		"homepage",
+		"fork",
+		"github_id",
+		"default_branch",
+		"master_branch",
+		"html_url",
+		"forks_count",
+		"open_issues_count",
+		"stargazers_count",
+		"subscribers_count",
+		"watchers_count",
+		"created_at",
+		"updated_at",
+		"pushed_at",
+	}
+	reposCollabosFields = []string{"user_id", "repository_id"}
+	orgMembersFields    = []string{"gh_user_id", "gh_organization_id"}
+)
+
 // config holds ght2dm configuration.
 type config struct {
-	// BSon files folders. The order is kept while processing them.
+	// BSON files folders. The order is kept while processing them.
 	//
 	// The name of each folder MUST match the name of the GitHub entity in
 	// snake case and pluralized (see defined constants).
@@ -140,14 +196,17 @@ func readConfig(path string) (*config, error) {
 	return &cfg, nil
 }
 
+// dumpReader is a reader for BSON files.
 type dumpReader struct {
 	r io.Reader
 }
 
+// newDumpReader creates a new dumpReader that reads from r.
 func newDumpReader(r io.Reader) *dumpReader {
 	return &dumpReader{r: r}
 }
 
+// ReadDoc reads the next BSON document.
 func (dr *dumpReader) ReadDoc() ([]byte, error) {
 	lenBuf := make([]byte, 4)
 	if n, err := dr.r.Read(lenBuf); err != nil {
@@ -174,7 +233,7 @@ func (dr *dumpReader) ReadDoc() ([]byte, error) {
 	return doc, nil
 }
 
-// importUsers imports a BSon file containing GitHub users into the DevMine
+// importUsers imports a BSON file containing GitHub users into the DevMine
 // database.
 func importUsers(path string) error {
 	f, err := os.Open(path)
@@ -184,6 +243,34 @@ func importUsers(path string) error {
 	defer f.Close()
 
 	r := newDumpReader(f)
+
+	// Begin a new transaction.
+	txn, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+
+	// Disable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users DROP CONSTRAINT gh_users_fk_users")
+	if err != nil {
+		return err
+	}
+
+	userStmt, err := txn.Prepare(genInsQuery("users", usersFields...) + " RETURNING id")
+	if err != nil {
+		return err
+	}
+
+	ghUserStmt, err := txn.Prepare(genInsQuery("gh_users", ghUsersFields...))
+	if err != nil {
+		return err
+	}
+
+	ghOrgStmt, err := txn.Prepare(genInsQuery("gh_organizations", ghOrgsFields...))
+	if err != nil {
+		return err
+	}
 
 	for {
 		bs, err := r.ReadDoc()
@@ -196,24 +283,26 @@ func importUsers(path string) error {
 
 		ghu := ghUser{}
 		if err := bson.Unmarshal(bs, &ghu); err != nil {
-			fail(err)
+			fail(path, ":", err)
 			continue
 		}
 
+		printVerbose("importing gh_user with login", ghu.Login)
+
 		switch ghu.Type {
 		case "User":
-			userID, err := insertUser(ghu)
+			userID, err := insertUser(txn, userStmt, ghu)
 			if err != nil {
 				fail(err)
 				continue
 			}
 
-			if _, err = insertGhUser(ghu, userID); err != nil {
+			if err := insertGhUser(txn, ghUserStmt, ghu, userID); err != nil {
 				fail(err)
 				continue
 			}
 		case "Organization":
-			if _, err = insertGhOrg(ghu); err != nil {
+			if err := insertGhOrg(txn, ghOrgStmt, ghu); err != nil {
 				fail(err)
 				continue
 			}
@@ -223,33 +312,35 @@ func importUsers(path string) error {
 		}
 	}
 
+	if err := userStmt.Close(); err != nil {
+		return err
+	}
+	if err := ghUserStmt.Close(); err != nil {
+		return err
+	}
+	if err := ghOrgStmt.Close(); err != nil {
+		return err
+	}
+
+	// Re-enable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users ADD CONSTRAINT gh_users_fk_users FOREIGN KEY (user_id) REFERENCES users(id)")
+	if err != nil {
+		return err
+	}
+
+	if err := txn.Commit(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // insertGhOrg inserts a GitHub organization into the database.
-func insertGhOrg(ghu ghUser) (int64, error) {
-	fields := []string{
-		"login",
-		"github_id",
-		"avatar_url",
-		"html_url",
-		"name",
-		"company",
-		"location",
-		"email",
-		"created_at",
-		"updated_at",
-	}
-
-	var q string
-	id := fetchOrgID(ghu.ID)
-	switch {
-	case id == 0:
-		q = genInsQuery("gh_organizations", fields...)
-	case id == -1:
-		return 0, errors.New("impossible to insert github organization with login = " + ghu.Login)
-	default:
-		q = genUpdateQuery("gh_organizations", id, fields...)
+func insertGhOrg(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser) error {
+	if id := fetchOrgID(txn, ghu.ID); id != 0 {
+		if id == -1 {
+			return errors.New("impossible to insert github organization with login = " + ghu.Login)
+		}
+		return nil
 	}
 
 	// Some documents only have a creation date, so for these ones, we set the
@@ -258,8 +349,7 @@ func insertGhOrg(ghu ghUser) (int64, error) {
 		ghu.UpdatedAt = ghu.CreatedAt
 	}
 
-	var ghOrgID int64
-	err := db.QueryRow(q+" RETURNING id",
+	_, err := stmt.Exec(
 		ghu.Login,
 		ghu.ID,
 		ghu.AvatarURL,
@@ -269,43 +359,21 @@ func insertGhOrg(ghu ghUser) (int64, error) {
 		ghu.Location,
 		ghu.Email,
 		ghu.CreatedAt,
-		ghu.UpdatedAt).Scan(&ghOrgID)
-
+		ghu.UpdatedAt)
 	if err != nil {
 		fail(err)
-		return 0, errors.New("impossible to insert github organization with login = " + ghu.Login)
+		return errors.New("impossible to insert github organization with login = " + ghu.Login)
 	}
-
-	return ghOrgID, nil
+	return nil
 }
 
 // insertGhUser inserts a GitHub user into the database.
-func insertGhUser(ghu ghUser, userID int64) (int64, error) {
-	fields := []string{
-		"user_id",
-		"github_id",
-		"login",
-		"bio",
-		"company",
-		"email",
-		"hireable",
-		"location",
-		"avatar_url",
-		"html_url",
-		"followers_count",
-		"following_count",
-		"created_at",
-		"updated_at",
-	}
-
-	var q string
-	switch id := fetchGhUserID(ghu.ID); id {
-	case 0:
-		q = genInsQuery("gh_users", fields...)
-	case -1:
-		return 0, errors.New("impossible to insert github user with login = " + ghu.Login)
-	default:
-		q = genUpdateQuery("gh_users", id, fields...)
+func insertGhUser(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser, userID int64) error {
+	if id := fetchGhUserID(txn, ghu.ID); id != 0 {
+		if id == -1 {
+			return errors.New("impossible to insert github user with login = " + ghu.Login)
+		}
+		return nil
 	}
 
 	// Some documents only have a creation date, so for these ones, we set the
@@ -314,8 +382,7 @@ func insertGhUser(ghu ghUser, userID int64) (int64, error) {
 		ghu.UpdatedAt = ghu.CreatedAt
 	}
 
-	var ghUserID int64
-	err := db.QueryRow(q+" RETURNING id",
+	_, err := stmt.Exec(
 		userID,
 		ghu.ID,
 		ghu.Login,
@@ -329,75 +396,48 @@ func insertGhUser(ghu ghUser, userID int64) (int64, error) {
 		ghu.Followers,
 		ghu.Following,
 		ghu.CreatedAt,
-		ghu.UpdatedAt).Scan(&ghUserID)
-
+		ghu.UpdatedAt)
 	if err != nil {
 		fail(err)
-		return 0, errors.New("impossible to insert github user with login = " + ghu.Login)
+		return errors.New("impossible to insert github user with login = " + ghu.Login)
 	}
-
-	return ghUserID, nil
+	return nil
 }
 
 // insertUser inserts a user into the database.
-func insertUser(ghu ghUser) (int64, error) {
-	fields := []string{"username", "name", "email"}
-
-	dateStr := ghu.CreatedAt
-	if ghu.UpdatedAt != "" {
-		dateStr = ghu.UpdatedAt
-	}
-
-	d, err := time.Parse(time.RFC3339, dateStr)
-	if err != nil {
-		return 0, err
-	}
-
-	var q string
-	id := fetchUserID(ghu.ID, &d)
-
-	switch {
-	case id == 0:
-		q = genInsQuery("users", fields...)
-	case id == -1:
-		return 0, errors.New("impossible to insert user with login " + ghu.Login)
-	default:
-		q = genUpdateQuery("users", id, fields...)
+func insertUser(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser) (int64, error) {
+	if id := fetchUserID(txn, ghu.ID); id != 0 {
+		if id == -1 {
+			return 0, errors.New("impossible to insert user with login " + ghu.Login)
+		}
+		return 0, nil
 	}
 
 	var userID int64
-	err = db.QueryRow(q+" RETURNING id", ghu.Login, ghu.Name, ghu.Email).Scan(&userID)
+	err := stmt.QueryRow(ghu.Login, ghu.Name, ghu.Email).Scan(&userID)
 	if err != nil {
 		fail(err)
 		return 0, errors.New("impossible to insert user with login " + ghu.Login)
 	}
-
 	return userID, nil
 }
 
 // fetchUserID fetches the user ID corresponding to a given GitHub user ID.
 //
-// It also takes the last modification date of that user as argument.
-//
 // It returns 0 if the user does not already exists in the database and -1 if
-// an error occured while processing the query or if the user in the database
-// is already up to date.
+// an error occured while processing the query.
 //
 // When an error occurs, this function takes care of logging it before
 // returning -1.
-func fetchUserID(githubID int64, d *time.Time) int64 {
+func fetchUserID(txn *sql.Tx, githubID int64) int64 {
 	var id int64
-	var updatedAt time.Time
-	err := db.QueryRow("SELECT user_id, updated_at FROM gh_users WHERE github_id=$1", githubID).Scan(&id, &updatedAt)
+	err := txn.QueryRow("SELECT user_id FROM gh_users WHERE github_id=$1", githubID).Scan(&id)
 
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
 	case err != nil:
 		fail("failed to fetch user id: ", err)
-		return -1
-	case d != nil && (d.Before(updatedAt) || d.Equal(updatedAt)):
-		fmt.Fprintf(os.Stderr, "users with github_id=%d is already up to date\n", githubID)
 		return -1
 	}
 
@@ -408,9 +448,9 @@ func fetchUserID(githubID int64, d *time.Time) int64 {
 // ID.
 // It returns 0 if the GitHub user does not already exists in the database and
 // -1 if an error occured while processing the query.
-func fetchGhUserID(githubID int64) int64 {
+func fetchGhUserID(txn *sql.Tx, githubID int64) int64 {
 	var id int64
-	err := db.QueryRow("SELECT id FROM gh_users WHERE github_id=$1", githubID).Scan(&id)
+	err := txn.QueryRow("SELECT id FROM gh_users WHERE github_id=$1", githubID).Scan(&id)
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
@@ -426,9 +466,10 @@ func fetchGhUserID(githubID int64) int64 {
 // ID.
 // It returns 0 if the organization does not already exists in the database and
 // -1 if an error occured while processing the query.
-func fetchOrgID(githubID int64) int64 {
+func fetchOrgID(txn *sql.Tx, githubID int64) int64 {
 	var id int64
-	err := db.QueryRow("SELECT id FROM gh_organizations WHERE github_id=$1", githubID).Scan(&id)
+	err := txn.QueryRow("SELECT id FROM gh_organizations WHERE github_id=$1", githubID).Scan(&id)
+
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
@@ -440,7 +481,7 @@ func fetchOrgID(githubID int64) int64 {
 	return id
 }
 
-// importRepos imports a BSon file containing GitHub repositories into the
+// importRepos imports a BSON file containing GitHub repositories into the
 // DevMine database.
 func importRepos(path string) error {
 	f, err := os.Open(path)
@@ -450,6 +491,28 @@ func importRepos(path string) error {
 	defer f.Close()
 
 	r := newDumpReader(f)
+
+	// Begin a new transaction.
+	txn, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+
+	// Disable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_repositories DROP CONSTRAINT gh_repositories_fk_repositories")
+	if err != nil {
+		return err
+	}
+
+	repoStmt, err := txn.Prepare(genInsQuery("repositories", reposFields...) + " RETURNING id")
+	if err != nil {
+		return err
+	}
+	ghRepoStmt, err := txn.Prepare(genInsQuery("gh_repositories", ghReposFields...))
+	if err != nil {
+		return err
+	}
 
 	for {
 		bs, err := r.ReadDoc()
@@ -466,92 +529,69 @@ func importRepos(path string) error {
 			continue
 		}
 
-		repoID, err := insertRepo(ghr)
+		printVerbose("importing gh_repo with clone url", ghr.HTMLURL+".git")
+
+		repoID, err := insertRepo(txn, repoStmt, ghr)
 		if err != nil {
 			fail(err)
 			continue
 		}
 
-		if _, err = insertGhRepo(ghr, repoID); err != nil {
+		if err := insertGhRepo(txn, ghRepoStmt, ghr, repoID); err != nil {
 			fail(err)
 			continue
 		}
 	}
 
+	if err := repoStmt.Close(); err != nil {
+		return err
+	}
+	if err := ghRepoStmt.Close(); err != nil {
+		return err
+	}
+
+	// Re-enable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_repositories ADD CONSTRAINT gh_repositories_fk_repositories FOREIGN KEY (repository_id) REFERENCES repositories(id)")
+	if err != nil {
+		return err
+	}
+
+	if err := txn.Commit(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // insertRepo inserts a repository into the database.
-func insertRepo(ghr ghRepo) (int64, error) {
+func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
+	if id := fetchRepoID(txn, ghr.ID); id != 0 {
+		if id == -1 {
+			return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
+		}
+		return 0, nil
+	}
+
 	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
-	fields := []string{"name", "primary_language", "clone_url", "clone_path", "vcs"}
-
-	dateStr := ghr.CreatedAt
-	if ghr.UpdatedAt != "" {
-		dateStr = ghr.UpdatedAt
-	}
-
-	d, err := time.Parse(time.RFC3339, dateStr)
-	if err != nil {
-		return 0, err
-	}
-
-	var q string
-	id := fetchRepoID(ghr.ID, &d)
-	switch {
-	case id == 0:
-		q = genInsQuery("repositories", fields...)
-	case id == -1:
-		return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
-	default:
-		q = genUpdateQuery("repositories", id, fields...)
-	}
 
 	var repoID int64
-	err = db.QueryRow(q+" RETURNING id", ghr.Name, ghr.Language, ghr.CloneURL, clonePath, "git").Scan(&repoID)
+	err := stmt.QueryRow(ghr.Name, ghr.Language, ghr.CloneURL, clonePath, "git").Scan(&repoID)
 	if err != nil {
 		fail(err)
 		return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
 	}
-
 	return repoID, nil
 }
 
 // insertGhRepo inserts a  GitHub repository into the database.
-func insertGhRepo(ghr ghRepo, repoID int64) (int64, error) {
-	fields := []string{
-		"repository_id",
-		"full_name",
-		"description",
-		"homepage",
-		"fork",
-		"github_id",
-		"default_branch",
-		"master_branch",
-		"html_url",
-		"forks_count",
-		"open_issues_count",
-		"stargazers_count",
-		"subscribers_count",
-		"watchers_count",
-		"created_at",
-		"updated_at",
-		"pushed_at",
+func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
+	if id := fetchRepoID(txn, ghr.ID); id != 0 {
+		if id == -1 {
+			return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
+		}
+		return nil
 	}
 
-	var q string
-	id := fetchRepoID(ghr.ID, nil)
-	switch {
-	case id == 0:
-		q = genInsQuery("gh_repositories", fields...)
-	case id == -1:
-		return 0, fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
-	default:
-		q = genUpdateQuery("gh_repositories", id, fields...)
-	}
-
-	var ghRepoID int64
-	err := db.QueryRow(q+" RETURNING id",
+	_, err := stmt.Exec(
 		repoID,
 		ghr.FullName,
 		ghr.Description,
@@ -568,40 +608,31 @@ func insertGhRepo(ghr ghRepo, repoID int64) (int64, error) {
 		ghr.WatchersCount,
 		ghr.CreatedAt,
 		ghr.UpdatedAt,
-		ghr.PushedAt).Scan(&ghRepoID)
-
+		ghr.PushedAt)
 	if err != nil {
 		fail(err)
-		return 0, fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
+		return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
 	}
-
-	return ghRepoID, nil
+	return nil
 }
 
 // fetchRepoID fetches the repository ID corresponding to a given GitHub
 // repository ID.
 //
-// It also takes the last modification date of that repository as argument.
-//
 // It returns 0 if the repository does not already exists in the database and
-// -1 if an error occured while processing the query or if the repository in
-// the database is already up to date.
+// -1 if an error occured while processing the query
 //
 // When an error occurs, this function takes care of logging it before
 // returning -1.
-func fetchRepoID(githubID int64, d *time.Time) int64 {
+func fetchRepoID(txn *sql.Tx, githubID int64) int64 {
 	var id int64
-	var updatedAt time.Time
-	err := db.QueryRow("SELECT repository_id, updated_at FROM gh_repositories WHERE github_id=$1", githubID).Scan(&id, &updatedAt)
+	err := txn.QueryRow("SELECT repository_id FROM gh_repositories WHERE github_id=$1", githubID).Scan(&id)
 
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
 	case err != nil:
 		fail("failed to fetch repository id: ", err)
-		return -1
-	case d != nil && (d.Before(updatedAt) || d.Equal(updatedAt)):
-		fmt.Fprintf(os.Stderr, "repository with github_id=%d is already up to date\n", githubID)
 		return -1
 	}
 
@@ -619,6 +650,18 @@ func importOrgMembers(path string) error {
 
 	r := newDumpReader(f)
 
+	// Begin a new transaction.
+	txn, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+
+	orgMemberStmt, err := txn.Prepare(genInsQuery("gh_users_organizations", orgMembersFields...))
+	if err != nil {
+		return err
+	}
+
 	for {
 		bs, err := r.ReadDoc()
 		if err == io.EOF {
@@ -634,18 +677,26 @@ func importOrgMembers(path string) error {
 			continue
 		}
 
-		if err := insertOrgMember(ghom); err != nil {
+		if err := insertOrgMember(txn, orgMemberStmt, ghom); err != nil {
 			fail(err)
 			continue
 		}
+	}
+
+	if err := orgMemberStmt.Close(); err != nil {
+		return err
+	}
+
+	if err := txn.Commit(); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // insertOrgMember inserts a GitHub organization member into the database.
-func insertOrgMember(ghom ghOrgMember) error {
-	rows, err := db.Query(`
+func insertOrgMember(txn *sql.Tx, stmt *sql.Stmt, ghom ghOrgMember) error {
+	rows, err := txn.Query(`
 		SELECT *
 		FROM gh_users_organizations
 		LEFT JOIN gh_users ON gh_users.id = gh_users_organizations.gh_user_id
@@ -664,25 +715,20 @@ func insertOrgMember(ghom ghOrgMember) error {
 		break // the relation does not already exist, so we can create it
 	}
 
-	ghUserID := fetchGhUserIDFromLogin(ghom.Login)
+	ghUserID := fetchGhUserIDFromLogin(txn, ghom.Login)
 	if ghUserID <= 0 {
 		return fmt.Errorf("failed to retrieve the id of the github user having the login %s", ghom.Login)
 	}
 
-	ghOrgID := fetchGhOrgIDFromLogin(ghom.Org)
+	ghOrgID := fetchGhOrgIDFromLogin(txn, ghom.Org)
 	if ghOrgID <= 0 {
 		return fmt.Errorf("failed to retrieve the id of the github organization having the login %s", ghom.Org)
 	}
 
-	fields := []string{"gh_user_id", "gh_organization_id"}
-	q := genInsQuery("gh_users_organizations", fields...)
-
-	_, err = db.Exec(q+" RETURNING id", ghUserID, ghOrgID)
-	if err != nil {
+	if _, err = stmt.Exec(ghUserID, ghOrgID); err != nil {
 		fail(err)
 		return fmt.Errorf("impossible to insert member organization with id %d", ghom.ID)
 	}
-
 	return nil
 }
 
@@ -690,9 +736,10 @@ func insertOrgMember(ghom ghOrgMember) error {
 // login.
 // It returns 0 if the GitHub user does not already exists in the database and
 // -1 if an error occured while processing the query.
-func fetchGhUserIDFromLogin(login string) int64 {
+func fetchGhUserIDFromLogin(txn *sql.Tx, login string) int64 {
 	var id int64
-	err := db.QueryRow("SELECT id FROM gh_users WHERE login=$1", login).Scan(&id)
+	err := txn.QueryRow("SELECT id FROM gh_users WHERE login=$1", login).Scan(&id)
+
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
@@ -708,9 +755,10 @@ func fetchGhUserIDFromLogin(login string) int64 {
 // given login.
 // It returns 0 if the GitHub organization does not already exists in the
 // database and -1 if an error occured while processing the query.
-func fetchGhOrgIDFromLogin(login string) int64 {
+func fetchGhOrgIDFromLogin(txn *sql.Tx, login string) int64 {
 	var id int64
-	err := db.QueryRow("SELECT id FROM gh_organizations WHERE login=$1", login).Scan(&id)
+	err := txn.QueryRow("SELECT id FROM gh_organizations WHERE login=$1", login).Scan(&id)
+
 	switch {
 	case err == sql.ErrNoRows:
 		return 0
@@ -722,7 +770,7 @@ func fetchGhOrgIDFromLogin(login string) int64 {
 	return id
 }
 
-// importRepoCollabo imports a BSon file containing GitHub repository
+// importRepoCollabo imports a BSON file containing GitHub repository
 // collaborators into the DevMine database.
 func importRepoCollabo(path string) error {
 	f, err := os.Open(path)
@@ -732,6 +780,18 @@ func importRepoCollabo(path string) error {
 	defer f.Close()
 
 	r := newDumpReader(f)
+
+	// Begin a new transaction.
+	txn, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+
+	repoCollaboStmt, err := txn.Prepare(genInsQuery("users_repositories", reposCollabosFields...))
+	if err != nil {
+		return err
+	}
 
 	for {
 		bs, err := r.ReadDoc()
@@ -748,19 +808,29 @@ func importRepoCollabo(path string) error {
 			continue
 		}
 
-		if err := insertRepoCollabo(ghrc); err != nil {
+		printVerbose("importing repo_collaborators with login", ghrc.Login, ", owner", ghrc.Owner, "and repo", ghrc.Repo)
+
+		if err := insertRepoCollabo(txn, repoCollaboStmt, ghrc); err != nil {
 			fail(err)
 			continue
 		}
+	}
+
+	if err := repoCollaboStmt.Close(); err != nil {
+		return err
+	}
+
+	if err := txn.Commit(); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // insertRepoCollabo inserts a GitHub repository collaborator into the database.
-func insertRepoCollabo(ghrc ghRepoCollaborator) error {
-	rows, err := db.Query(`
-		SELECT *
+func insertRepoCollabo(txn *sql.Tx, stmt *sql.Stmt, ghrc ghRepoCollaborator) error {
+	rows, err := txn.Query(`
+		SELECT users_repositories.user_id, users_repositories.repository_id
 		FROM users_repositories
 		LEFT JOIN users ON users.id = users_repositories.user_id
 		LEFT JOIN gh_users ON gh_users.user_id = users.id
@@ -768,10 +838,16 @@ func insertRepoCollabo(ghrc ghRepoCollaborator) error {
 		LEFT JOIN gh_repositories ON gh_repositories.id = repositories.id
 		WHERE gh_users.login = $1 AND gh_repositories.full_name = $2
 	`, ghrc.Login, ghrc.Owner+"/"+ghrc.Repo)
-	defer rows.Close()
+	if rows != nil {
+		defer rows.Close()
+	}
 
 	switch {
-	case rows.Next():
+	case rows != nil && rows.Next():
+		var userID, repoID int64
+		if err := rows.Scan(&userID, &repoID); err == nil {
+			printVerbose(fmt.Sprintf("the users_repositories relation (%d, %d) already exists", userID, repoID))
+		}
 		return nil // the relation already exist, no need to create it
 	case err != nil:
 		fail(err)
@@ -780,25 +856,20 @@ func insertRepoCollabo(ghrc ghRepoCollaborator) error {
 		break // the relation does not already exist, so we can create it
 	}
 
-	ghUserID := fetchGhUserIDFromLogin(ghrc.Login)
+	ghUserID := fetchGhUserIDFromLogin(txn, ghrc.Login)
 	if ghUserID <= 0 {
 		return fmt.Errorf("failed to retrieve github user id with login %s", ghrc.Login)
 	}
 
-	ghRepoID := fetchRepoIDFromFullname(ghrc.Owner + "/" + ghrc.Repo)
+	ghRepoID := fetchRepoIDFromFullname(txn, ghrc.Owner+"/"+ghrc.Repo)
 	if ghRepoID <= 0 {
 		return fmt.Errorf("failed to retrieve github repository id with login %s", ghrc.Login)
 	}
 
-	fields := []string{"user_id", "repository_id"}
-	q := genInsQuery("users_repositories", fields...)
-
-	_, err = db.Exec(q+" RETURNING id", ghUserID, ghRepoID)
-	if err != nil {
+	if _, err = stmt.Exec(ghUserID, ghRepoID); err != nil {
 		fail(err)
 		return fmt.Errorf("impossible to fetch insert repository collaborator with id %d", ghrc.ID)
 	}
-
 	return nil
 }
 
@@ -806,13 +877,13 @@ func insertRepoCollabo(ghrc ghRepoCollaborator) error {
 // given GitHub repository fullname.
 // It returns 0 if the repository does not already exists in the
 // database and -1 if an error occured while processing the query.
-func fetchRepoIDFromFullname(fullname string) int64 {
+func fetchRepoIDFromFullname(txn *sql.Tx, fullname string) int64 {
 	var id int64
-	err := db.QueryRow(`
+	err := txn.QueryRow(`
 		SELECT repositories.id AS repo_id
 		FROM repositories
 		LEFT JOIN gh_repositories ON gh_repositories.repository_id = repositories.id
-		WHERE gh_repositories.full_name =$1
+		WHERE gh_repositories.full_name=$1
 	`, fullname).Scan(&id)
 
 	switch {
@@ -842,27 +913,6 @@ func genInsQuery(tableName string, fields ...string) string {
 	}
 
 	buf.WriteString(")\n")
-
-	return buf.String()
-}
-
-// genUpdateQuery generates a query string for an update of fields into the
-// database.
-func genUpdateQuery(tableName string, id int64, fields ...string) string {
-	var buf bytes.Buffer
-
-	buf.WriteString(fmt.Sprintf("UPDATE %s\n", tableName))
-	buf.WriteString("SET ")
-
-	for ind, field := range fields {
-		if ind > 0 {
-			buf.WriteString(",")
-		}
-
-		buf.WriteString(fmt.Sprintf("%s=$%d", field, ind+1))
-	}
-
-	buf.WriteString(fmt.Sprintf("WHERE id=%d\n", id))
 
 	return buf.String()
 }
@@ -924,11 +974,25 @@ func visit(path, entity string) error {
 
 		switch entity {
 		case ghUsers:
-			err = importUsers(fullpath)
+			if err = importUsers(fullpath); err != nil {
+				break
+			}
+			// Since we are doing a bulk imports, we had to disable constraint key
+			// validation and insert the users and gh_users without relation. Thus we
+			// have to create the relations now. For database consistency, it is
+			// important that this operation not fail.
+			/*if err := linkGhUserToUser(); err != nil {
+				return fmt.Errorf("failed to link all gh_users to users: %v", err)
+			}*/
 		case ghOrgMembers:
 			err = importOrgMembers(fullpath)
 		case ghRepos:
-			err = importRepos(fullpath)
+			if err = importRepos(fullpath); err != nil {
+				break
+			}
+			/*if err := linkGhRepoToRepo(); err != nil {
+				fail(fmt.Errorf("failed to link all gh_repos to repos: %v", err))
+			}*/
 		case ghRepoCollaborators:
 			err = importRepoCollabo(fullpath)
 		}
@@ -944,13 +1008,45 @@ func visit(path, entity string) error {
 
 // fatal log an error into stderr and exit with status 1.
 func fatal(a ...interface{}) {
-	fmt.Fprintln(os.Stderr, a...)
+	// XXX: avoid code duplication
+	var msg string
+	if *dflag {
+		_, file, line, ok := runtime.Caller(1)
+		if !ok {
+			file = "???"
+			line = 0
+		} else {
+			file = filepath.Base(file)
+		}
+		msg = fmt.Sprintf("[%s:%d]", file, line)
+	}
+	msg += fmt.Sprint(a...)
+	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
 }
 
 // fail log an error without exiting.
 func fail(a ...interface{}) {
-	fmt.Fprintln(os.Stderr, a...)
+	var msg string
+	if *dflag {
+		_, file, line, ok := runtime.Caller(1)
+		if !ok {
+			file = "???"
+			line = 0
+		} else {
+			file = filepath.Base(file)
+		}
+		msg = fmt.Sprintf("[%s:%d]", file, line)
+	}
+	msg += fmt.Sprint(a...)
+	fmt.Fprintln(os.Stderr, msg)
+}
+
+// printVerbose only print messages when the verbose mode is enabled by vflag.
+func printVerbose(a ...interface{}) {
+	if *vflag {
+		fmt.Println(a...)
+	}
 }
 
 // db is the database session
@@ -972,16 +1068,24 @@ func setupDB(cfg devmineDatabase) error {
 	return nil
 }
 
+// Command line options.
+var (
+	vflag = flag.Bool("v", false, "enable verbose mode")
+	dflag = flag.Bool("d", false, "enable debug mode")
+)
+
 func main() {
 	flag.Usage = func() {
-		fmt.Printf("usage: %s [config]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s [config]\n\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "Available options:")
+		flag.PrintDefaults()
+		os.Exit(1)
 	}
 	flag.Parse()
 
 	if flag.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "invalid # of arguments")
-		flag.PrintDefaults()
-		os.Exit(1)
+		flag.Usage()
 	}
 
 	cfg, err := readConfig(flag.Arg(0))
