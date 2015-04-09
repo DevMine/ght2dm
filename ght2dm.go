@@ -336,11 +336,13 @@ func importUsers(path string) error {
 
 // insertGhOrg inserts a GitHub organization into the database.
 func insertGhOrg(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser) error {
-	if id := fetchOrgID(txn, ghu.ID); id != 0 {
-		if id == -1 {
-			return errors.New("impossible to insert github organization with login = " + ghu.Login)
+	if !*nocheck {
+		if id := fetchOrgID(txn, ghu.ID); id != 0 {
+			if id == -1 {
+				return errors.New("impossible to insert github organization with login = " + ghu.Login)
+			}
+			return nil
 		}
-		return nil
 	}
 
 	// Some documents only have a creation date, so for these ones, we set the
@@ -369,11 +371,13 @@ func insertGhOrg(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser) error {
 
 // insertGhUser inserts a GitHub user into the database.
 func insertGhUser(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser, userID int64) error {
-	if id := fetchGhUserID(txn, ghu.ID); id != 0 {
-		if id == -1 {
-			return errors.New("impossible to insert github user with login = " + ghu.Login)
+	if !*nocheck {
+		if id := fetchGhUserID(txn, ghu.ID); id != 0 {
+			if id == -1 {
+				return errors.New("impossible to insert github user with login = " + ghu.Login)
+			}
+			return nil
 		}
-		return nil
 	}
 
 	// Some documents only have a creation date, so for these ones, we set the
@@ -406,11 +410,13 @@ func insertGhUser(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser, userID int64) error {
 
 // insertUser inserts a user into the database.
 func insertUser(txn *sql.Tx, stmt *sql.Stmt, ghu ghUser) (int64, error) {
-	if id := fetchUserID(txn, ghu.ID); id != 0 {
-		if id == -1 {
-			return 0, errors.New("impossible to insert user with login " + ghu.Login)
+	if !*nocheck {
+		if id := fetchUserID(txn, ghu.ID); id != 0 {
+			if id == -1 {
+				return 0, errors.New("impossible to insert user with login " + ghu.Login)
+			}
+			return 0, nil
 		}
-		return 0, nil
 	}
 
 	var userID int64
@@ -564,11 +570,13 @@ func importRepos(path string) error {
 
 // insertRepo inserts a repository into the database.
 func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
-	if id := fetchRepoID(txn, ghr.ID); id != 0 {
-		if id == -1 {
-			return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
+	if !*nocheck {
+		if id := fetchRepoID(txn, ghr.ID); id != 0 {
+			if id == -1 {
+				return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
+			}
+			return 0, nil
 		}
-		return 0, nil
 	}
 
 	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
@@ -584,11 +592,13 @@ func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
 
 // insertGhRepo inserts a  GitHub repository into the database.
 func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
-	if id := fetchRepoID(txn, ghr.ID); id != 0 {
-		if id == -1 {
-			return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
+	if !*nocheck {
+		if id := fetchRepoID(txn, ghr.ID); id != 0 {
+			if id == -1 {
+				return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
+			}
+			return nil
 		}
-		return nil
 	}
 
 	_, err := stmt.Exec(
@@ -657,6 +667,16 @@ func importOrgMembers(path string) error {
 	}
 	defer txn.Rollback()
 
+	// Disable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users_organizations DROP CONSTRAINT gh_users_organizations_fk_organization")
+	if err != nil {
+		return err
+	}
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users_organizations DROP CONSTRAINT gh_users_organizations_fk_users")
+	if err != nil {
+		return err
+	}
+
 	orgMemberStmt, err := txn.Prepare(genInsQuery("gh_users_organizations", orgMembersFields...))
 	if err != nil {
 		return err
@@ -687,6 +707,16 @@ func importOrgMembers(path string) error {
 		return err
 	}
 
+	// Re-enable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users_organizations ADD CONSTRAINT gh_users_organizations_fk_organization FOREIGN KEY (gh_organization_id) REFERENCES gh_organizations(id)")
+	if err != nil {
+		return err
+	}
+	_, err = txn.Exec("ALTER TABLE ONLY gh_users_organizations ADD CONSTRAINT gh_users_organizations_fk_users FOREIGN KEY (gh_user_id) REFERENCES gh_users(id)")
+	if err != nil {
+		return err
+	}
+
 	if err := txn.Commit(); err != nil {
 		return err
 	}
@@ -696,23 +726,29 @@ func importOrgMembers(path string) error {
 
 // insertOrgMember inserts a GitHub organization member into the database.
 func insertOrgMember(txn *sql.Tx, stmt *sql.Stmt, ghom ghOrgMember) error {
-	rows, err := txn.Query(`
-		SELECT *
+	if !*nocheck {
+		rows, err := txn.Query(`
+		SELECT gh_users_organizations.gh_user_id, gh_users_organizations.gh_organization_id
 		FROM gh_users_organizations
 		LEFT JOIN gh_users ON gh_users.id = gh_users_organizations.gh_user_id
 		LEFT JOIN gh_organizations ON gh_organizations.id = gh_users_organizations.gh_organization_id
 		WHERE gh_users.login = $1 AND gh_organizations.login = $2
 	`, ghom.Login, ghom.Org)
-	defer rows.Close()
+		defer rows.Close()
 
-	switch {
-	case rows.Next():
-		return nil // the relation already exist, no need to create it
-	case err != nil:
-		fail(err)
-		return fmt.Errorf("impossible to fetch member organization with id %d", ghom.ID)
-	default:
-		break // the relation does not already exist, so we can create it
+		switch {
+		case rows != nil && rows.Next():
+			var ghUserID, ghOrgID int64
+			if err := rows.Scan(&ghUserID, &ghOrgID); err == nil {
+				printVerbose(fmt.Sprintf("the gh_users_organizations relation (%d, %d) already exists", ghUserID, ghOrgID))
+			}
+			return nil // the relation already exist, no need to create it
+		case err != nil:
+			fail(err)
+			return fmt.Errorf("impossible to fetch member organization with id %d", ghom.ID)
+		default:
+			break // the relation does not already exist, so we can create it
+		}
 	}
 
 	ghUserID := fetchGhUserIDFromLogin(txn, ghom.Login)
@@ -725,7 +761,7 @@ func insertOrgMember(txn *sql.Tx, stmt *sql.Stmt, ghom ghOrgMember) error {
 		return fmt.Errorf("failed to retrieve the id of the github organization having the login %s", ghom.Org)
 	}
 
-	if _, err = stmt.Exec(ghUserID, ghOrgID); err != nil {
+	if _, err := stmt.Exec(ghUserID, ghOrgID); err != nil {
 		fail(err)
 		return fmt.Errorf("impossible to insert member organization with id %d", ghom.ID)
 	}
@@ -788,6 +824,16 @@ func importRepoCollabo(path string) error {
 	}
 	defer txn.Rollback()
 
+	// Disable foreign key constraints.
+	/*_, err = txn.Exec("ALTER TABLE ONLY users_repositories DROP CONSTRAINT users_repositories_fk_repository")
+	if err != nil {
+		return err
+	}
+	_, err = txn.Exec("ALTER TABLE ONLY users_repositories DROP CONSTRAINT users_repositories_fk_users")
+	if err != nil {
+		return err
+	}*/
+
 	repoCollaboStmt, err := txn.Prepare(genInsQuery("users_repositories", reposCollabosFields...))
 	if err != nil {
 		return err
@@ -820,6 +866,16 @@ func importRepoCollabo(path string) error {
 		return err
 	}
 
+	// Re-enable foreign key constraints.
+	_, err = txn.Exec("ALTER TABLE ONLY users_repositories ADD CONSTRAINT users_repositories_fk_repository FOREIGN KEY (repository_id) REFERENCES repositories(id)")
+	if err != nil {
+		return err
+	}
+	_, err = txn.Exec("ALTER TABLE ONLY users_repositories ADD CONSTRAINT users_repositories_fk_users FOREIGN KEY (user_id) REFERENCES users(id)")
+	if err != nil {
+		return err
+	}
+
 	if err := txn.Commit(); err != nil {
 		return err
 	}
@@ -829,7 +885,8 @@ func importRepoCollabo(path string) error {
 
 // insertRepoCollabo inserts a GitHub repository collaborator into the database.
 func insertRepoCollabo(txn *sql.Tx, stmt *sql.Stmt, ghrc ghRepoCollaborator) error {
-	rows, err := txn.Query(`
+	if !*nocheck {
+		rows, err := txn.Query(`
 		SELECT users_repositories.user_id, users_repositories.repository_id
 		FROM users_repositories
 		LEFT JOIN users ON users.id = users_repositories.user_id
@@ -838,22 +895,23 @@ func insertRepoCollabo(txn *sql.Tx, stmt *sql.Stmt, ghrc ghRepoCollaborator) err
 		LEFT JOIN gh_repositories ON gh_repositories.id = repositories.id
 		WHERE gh_users.login = $1 AND gh_repositories.full_name = $2
 	`, ghrc.Login, ghrc.Owner+"/"+ghrc.Repo)
-	if rows != nil {
-		defer rows.Close()
-	}
-
-	switch {
-	case rows != nil && rows.Next():
-		var userID, repoID int64
-		if err := rows.Scan(&userID, &repoID); err == nil {
-			printVerbose(fmt.Sprintf("the users_repositories relation (%d, %d) already exists", userID, repoID))
+		if rows != nil {
+			defer rows.Close()
 		}
-		return nil // the relation already exist, no need to create it
-	case err != nil:
-		fail(err)
-		return fmt.Errorf("impossible to fetch repo collaborator with id %d", ghrc.ID)
-	default:
-		break // the relation does not already exist, so we can create it
+
+		switch {
+		case rows != nil && rows.Next():
+			var userID, repoID int64
+			if err := rows.Scan(&userID, &repoID); err == nil {
+				printVerbose(fmt.Sprintf("the users_repositories relation (%d, %d) already exists", userID, repoID))
+			}
+			return nil // the relation already exist, no need to create it
+		case err != nil:
+			fail(err)
+			return fmt.Errorf("impossible to fetch repo collaborator with id %d", ghrc.ID)
+		default:
+			break // the relation does not already exist, so we can create it
+		}
 	}
 
 	ghUserID := fetchGhUserIDFromLogin(txn, ghrc.Login)
@@ -866,7 +924,7 @@ func insertRepoCollabo(txn *sql.Tx, stmt *sql.Stmt, ghrc ghRepoCollaborator) err
 		return fmt.Errorf("failed to retrieve github repository id with login %s", ghrc.Login)
 	}
 
-	if _, err = stmt.Exec(ghUserID, ghRepoID); err != nil {
+	if _, err := stmt.Exec(ghUserID, ghRepoID); err != nil {
 		fail(err)
 		return fmt.Errorf("impossible to fetch insert repository collaborator with id %d", ghrc.ID)
 	}
@@ -977,22 +1035,12 @@ func visit(path, entity string) error {
 			if err = importUsers(fullpath); err != nil {
 				break
 			}
-			// Since we are doing a bulk imports, we had to disable constraint key
-			// validation and insert the users and gh_users without relation. Thus we
-			// have to create the relations now. For database consistency, it is
-			// important that this operation not fail.
-			/*if err := linkGhUserToUser(); err != nil {
-				return fmt.Errorf("failed to link all gh_users to users: %v", err)
-			}*/
 		case ghOrgMembers:
 			err = importOrgMembers(fullpath)
 		case ghRepos:
 			if err = importRepos(fullpath); err != nil {
 				break
 			}
-			/*if err := linkGhRepoToRepo(); err != nil {
-				fail(fmt.Errorf("failed to link all gh_repos to repos: %v", err))
-			}*/
 		case ghRepoCollaborators:
 			err = importRepoCollabo(fullpath)
 		}
@@ -1070,8 +1118,9 @@ func setupDB(cfg devmineDatabase) error {
 
 // Command line options.
 var (
-	vflag = flag.Bool("v", false, "enable verbose mode")
-	dflag = flag.Bool("d", false, "enable debug mode")
+	vflag   = flag.Bool("v", false, "enable verbose mode")
+	dflag   = flag.Bool("d", false, "enable debug mode")
+	nocheck = flag.Bool("nocheck", false, "do not check if an entry is already present in the database (only use when there is no duplicate)")
 )
 
 func main() {
