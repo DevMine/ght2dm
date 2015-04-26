@@ -9,6 +9,9 @@ install:
 build:
 	go build -o ${EXEC} ${PKG}
 
+deps:
+	go get -u labix.org/v2/mgo/bson
+
 check:
 	go vet ${PKG}
 	golint ${PKG}
