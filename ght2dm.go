@@ -571,7 +571,7 @@ func importRepos(path string) error {
 // insertRepo inserts a repository into the database.
 func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
 	if !*nocheck {
-		if id := fetchRepoID(txn, ghr.ID); id != 0 {
+		if id := fetchRepoID(txn, ghr); id != 0 {
 			if id == -1 {
 				return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
 			}
@@ -593,12 +593,30 @@ func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
 // insertGhRepo inserts a  GitHub repository into the database.
 func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
 	if !*nocheck {
-		if id := fetchRepoID(txn, ghr.ID); id != 0 {
+		if id := fetchRepoID(txn, ghr); id != 0 {
 			if id == -1 {
 				return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
 			}
 			return nil
 		}
+	}
+
+	// Ensure that the dates are not empty strings "", otherwise PosgtreSQL fails
+	// to insert the new entry.
+
+	createdAt := &ghr.CreatedAt
+	if *createdAt == "" {
+		createdAt = nil
+	}
+
+	updatedAt := &ghr.UpdatedAt
+	if *updatedAt == "" {
+		updatedAt = nil
+	}
+
+	pushedAt := &ghr.PushedAt
+	if *pushedAt == "" {
+		pushedAt = nil
 	}
 
 	_, err := stmt.Exec(
@@ -616,9 +634,9 @@ func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
 		ghr.StargazersCount,
 		ghr.SubscribersCount,
 		ghr.WatchersCount,
-		ghr.CreatedAt,
-		ghr.UpdatedAt,
-		ghr.PushedAt)
+		createdAt,
+		updatedAt,
+		pushedAt)
 	if err != nil {
 		fail(err)
 		return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
@@ -634,9 +652,16 @@ func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
 //
 // When an error occurs, this function takes care of logging it before
 // returning -1.
-func fetchRepoID(txn *sql.Tx, githubID int64) int64 {
+func fetchRepoID(txn *sql.Tx, ghr ghRepo) int64 {
+	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
 	var id int64
-	err := txn.QueryRow("SELECT repository_id FROM gh_repositories WHERE github_id=$1", githubID).Scan(&id)
+	err := txn.QueryRow(`
+		SELECT repositories.id
+		FROM gh_repositories
+		LEFT JOIN repositories ON repositories.id = gh_repositories.repository_id
+		WHERE gh_repositories.github_id=$1
+		OR repositories.clone_url=$2
+		OR repositories.clone_path=$3`, ghr.ID, ghr.CloneURL, clonePath).Scan(&id)
 
 	switch {
 	case err == sql.ErrNoRows:
@@ -887,14 +912,14 @@ func importRepoCollabo(path string) error {
 func insertRepoCollabo(txn *sql.Tx, stmt *sql.Stmt, ghrc ghRepoCollaborator) error {
 	if !*nocheck {
 		rows, err := txn.Query(`
-		SELECT users_repositories.user_id, users_repositories.repository_id
-		FROM users_repositories
-		LEFT JOIN users ON users.id = users_repositories.user_id
-		LEFT JOIN gh_users ON gh_users.user_id = users.id
-		LEFT JOIN repositories ON repositories.id = users_repositories.repository_id
-		LEFT JOIN gh_repositories ON gh_repositories.id = repositories.id
-		WHERE gh_users.login = $1 AND gh_repositories.full_name = $2
-	`, ghrc.Login, ghrc.Owner+"/"+ghrc.Repo)
+			SELECT users_repositories.user_id, users_repositories.repository_id
+			FROM users_repositories
+			LEFT JOIN users ON users.id = users_repositories.user_id
+			LEFT JOIN gh_users ON gh_users.user_id = users.id
+			LEFT JOIN repositories ON repositories.id = users_repositories.repository_id
+			LEFT JOIN gh_repositories ON gh_repositories.id = repositories.id
+			WHERE gh_users.login = $1 AND gh_repositories.full_name = $2
+		`, ghrc.Login, ghrc.Owner+"/"+ghrc.Repo)
 		if rows != nil {
 			defer rows.Close()
 		}
