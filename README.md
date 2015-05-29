@@ -14,9 +14,11 @@ go get -u github.com/DevMine/ght2dm
 
 ## Usage
 
-*IMPORTANT:* Make sure to run the script in `db/create_tmp_table.sql` before
-running `ght2dm`. The latter assumes that this table is created and empty. Note
-that this script is useful only when importing `repositories`.
+*IMPORTANT:* Make sure to run the script `db/create_tmp_table.sql` before
+running `ght2dm`. The latter assumes that this table is created and empty. Make
+also sure to run the script `db/insert_from_tmp_tables.sql` after the execution
+of `ght2dm`. Note that these two scripts are only useful when importing
+`repositories`.
 
 `ght2dm` usage is pretty simple: it only requires to pass a configuration file
 as argument:
