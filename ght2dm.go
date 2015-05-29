@@ -22,9 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
 	"labix.org/v2/mgo/bson"
-
-	_ "github.com/lib/pq"
 )
 
 // GitHub entities
@@ -133,9 +132,12 @@ var (
 		"created_at",
 		"updated_at",
 	}
-	reposFields   = []string{"name", "primary_language", "clone_url", "clone_path", "vcs"}
-	ghReposFields = []string{
-		"repository_id",
+	tmpReposFields = []string{
+		"name",
+		"primary_language",
+		"clone_url",
+		"clone_path",
+		"vcs",
 		"full_name",
 		"description",
 		"homepage",
@@ -505,17 +507,7 @@ func importRepos(path string) error {
 	}
 	defer txn.Rollback()
 
-	// Disable foreign key constraints.
-	_, err = txn.Exec("ALTER TABLE ONLY gh_repositories DROP CONSTRAINT gh_repositories_fk_repositories")
-	if err != nil {
-		return err
-	}
-
-	repoStmt, err := txn.Prepare(genInsQuery("repositories", reposFields...) + " RETURNING id")
-	if err != nil {
-		return err
-	}
-	ghRepoStmt, err := txn.Prepare(genInsQuery("gh_repositories", ghReposFields...))
+	tmpRepoStmt, err := txn.Prepare(pq.CopyIn("tmp_gh_repositories", tmpReposFields...))
 	if err != nil {
 		return err
 	}
@@ -537,90 +529,49 @@ func importRepos(path string) error {
 
 		printVerbose("importing gh_repo with clone url", ghr.HTMLURL+".git")
 
-		repoID, err := insertRepo(txn, repoStmt, ghr)
-		if err != nil {
-			fail(err)
-			continue
-		}
-
-		if err := insertGhRepo(txn, ghRepoStmt, ghr, repoID); err != nil {
+		if err := insertTmpRepo(txn, tmpRepoStmt, ghr); err != nil {
 			fail(err)
 			continue
 		}
 	}
 
-	if err := repoStmt.Close(); err != nil {
+	if _, err := tmpRepoStmt.Exec(); err != nil {
 		return err
 	}
-	if err := ghRepoStmt.Close(); err != nil {
+	if err := tmpRepoStmt.Close(); err != nil {
 		return err
 	}
-
-	// Re-enable foreign key constraints.
-	_, err = txn.Exec("ALTER TABLE ONLY gh_repositories ADD CONSTRAINT gh_repositories_fk_repositories FOREIGN KEY (repository_id) REFERENCES repositories(id)")
-	if err != nil {
-		return err
-	}
-
 	if err := txn.Commit(); err != nil {
 		return err
 	}
 	return nil
 }
 
-// insertRepo inserts a repository into the database.
-func insertRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) (int64, error) {
-	if !*nocheck {
-		if id := fetchRepoID(txn, ghr); id != 0 {
-			if id == -1 {
-				return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
-			}
-			return 0, nil
-		}
-	}
-
+// insertTmpRepo inserts a repository into a temporary table in the database.
+func insertTmpRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) error {
 	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
-
-	var repoID int64
-	err := stmt.QueryRow(ghr.Name, ghr.Language, ghr.CloneURL, clonePath, "git").Scan(&repoID)
-	if err != nil {
-		fail(err)
-		return 0, fmt.Errorf("impossible to insert repository with id %d", ghr.ID)
-	}
-	return repoID, nil
-}
-
-// insertGhRepo inserts a  GitHub repository into the database.
-func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
-	if !*nocheck {
-		if id := fetchRepoID(txn, ghr); id != 0 {
-			if id == -1 {
-				return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
-			}
-			return nil
-		}
-	}
 
 	// Ensure that the dates are not empty strings "", otherwise PosgtreSQL fails
 	// to insert the new entry.
-
 	createdAt := &ghr.CreatedAt
 	if *createdAt == "" {
 		createdAt = nil
 	}
-
 	updatedAt := &ghr.UpdatedAt
 	if *updatedAt == "" {
 		updatedAt = nil
 	}
-
 	pushedAt := &ghr.PushedAt
 	if *pushedAt == "" {
 		pushedAt = nil
 	}
 
 	_, err := stmt.Exec(
-		repoID,
+		ghr.Name,
+		ghr.Language,
+		ghr.CloneURL,
+		clonePath,
+		"git",
 		ghr.FullName,
 		ghr.Description,
 		ghr.Homepage,
@@ -639,7 +590,7 @@ func insertGhRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo, repoID int64) error {
 		pushedAt)
 	if err != nil {
 		fail(err)
-		return fmt.Errorf("impossible to insert github repository with id %d", ghr.ID)
+		return fmt.Errorf("impossible to insert tmp repository with github_id %d", ghr.ID)
 	}
 	return nil
 }

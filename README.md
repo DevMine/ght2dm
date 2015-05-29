@@ -14,6 +14,10 @@ go get -u github.com/DevMine/ght2dm
 
 ## Usage
 
+*IMPORTANT:* Make sure to run the script in `db/create_tmp_table.sql` before
+running `ght2dm`. The latter assumes that this table is created and empty. Note
+that this script is useful only when importing `repositories`.
+
 `ght2dm` usage is pretty simple: it only requires to pass a configuration file
 as argument:
 
@@ -66,4 +70,3 @@ The currently supported entities are:
 
 Each `bson` dump must be named according to its creation date and using the
 format `yyyy-mm-dd`. Files that does not respect this convention are skipped.
-
