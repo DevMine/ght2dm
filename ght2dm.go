@@ -566,6 +566,14 @@ func buildClonePath(ghr ghRepo) string {
 	return strings.ToLower(filepath.Join(lang, login, name))
 }
 
+// removeNullByte removes null bytes from s.
+//
+// Null bytes make PostgreSQL insertions to fail, thus this function must
+// must be used on every string that could possibly contain a null byte.
+func removeNullByte(s string) string {
+	return string(bytes.Replace([]byte(s), []byte{0x0}, []byte{}, -1))
+}
+
 // insertTmpRepo inserts a repository into a temporary table in the database.
 func insertTmpRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) error {
 	clonePath := buildClonePath(ghr)
@@ -586,19 +594,19 @@ func insertTmpRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) error {
 	}
 
 	_, err := stmt.Exec(
-		ghr.Name,
-		ghr.Language,
-		ghr.CloneURL,
-		clonePath,
+		removeNullByte(ghr.Name),
+		removeNullByte(ghr.Language),
+		removeNullByte(ghr.CloneURL),
+		removeNullByte(clonePath),
 		"git",
-		ghr.FullName,
-		ghr.Description,
-		ghr.Homepage,
+		removeNullByte(ghr.FullName),
+		removeNullByte(ghr.Description),
+		removeNullByte(ghr.Homepage),
 		ghr.Fork,
 		ghr.ID,
-		ghr.DefaultBranch,
-		ghr.MasterBranch,
-		ghr.HTMLURL,
+		removeNullByte(ghr.DefaultBranch),
+		removeNullByte(ghr.MasterBranch),
+		removeNullByte(ghr.HTMLURL),
 		ghr.ForksCount,
 		ghr.OpenIssuesCount,
 		ghr.StargazersCount,
