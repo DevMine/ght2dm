@@ -547,9 +547,28 @@ func importRepos(path string) error {
 	return nil
 }
 
+// buildClonePath build the clone path for a repository.
+func buildClonePath(ghr ghRepo) string {
+	lang := ghr.Language
+	if lang == "" {
+		lang = "unknown"
+	}
+	login := ghr.Owner.Login
+	if login == "" {
+		// should NEVER happen!!
+		login = "john_doe"
+	}
+	name := ghr.Name
+	if name == "" {
+		// should NEVER happen!!
+		name = "42"
+	}
+	return strings.ToLower(filepath.Join(lang, login, name))
+}
+
 // insertTmpRepo inserts a repository into a temporary table in the database.
 func insertTmpRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) error {
-	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
+	clonePath := buildClonePath(ghr)
 
 	// Ensure that the dates are not empty strings "", otherwise PosgtreSQL fails
 	// to insert the new entry.
@@ -604,7 +623,7 @@ func insertTmpRepo(txn *sql.Tx, stmt *sql.Stmt, ghr ghRepo) error {
 // When an error occurs, this function takes care of logging it before
 // returning -1.
 func fetchRepoID(txn *sql.Tx, ghr ghRepo) int64 {
-	clonePath := strings.ToLower(filepath.Join(ghr.Language, ghr.Owner.Login, ghr.Name))
+	clonePath := buildClonePath(ghr)
 	var id int64
 	err := txn.QueryRow(`
 		SELECT repositories.id
