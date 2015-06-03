@@ -45,7 +45,7 @@ BEGIN
                 tmp.max_open_issues_count = tgr.open_issues_count
             )
         LEFT JOIN gh_repositories AS gr ON tgr.github_id = gr.github_id
-        LEFT JOIN repositories AS r ON tgr.clone_path = r.clone_path
+        LEFT JOIN repositories AS r ON (tgr.clone_path = r.clone_path AND tgr.primary_language = r.primary_language)
         WHERE gr.id IS NULL AND r.id IS NULL AND tgr.clone_url <> '' AND tgr.clone_path <> '' AND tgr.primary_language <> ''
     LOOP
         -- raise notice 'Value: %', repo;
