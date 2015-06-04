@@ -5,6 +5,11 @@ DECLARE
     repo_id repositories.id%TYPE;
     repo tmp_gh_repositories%ROWTYPE;
 BEGIN
+    -- disable constraints
+    ALTER TABLE ONLY repositories DROP CONSTRAINT repositories_unique_clone_path;
+    ALTER TABLE ONLY repositories DROP CONSTRAINT repositories_unique_clone_url;
+    ALTER TABLE ONLY gh_repositories DROP CONSTRAINT gh_repositories_fk_repositories;
+
     FOR repo IN
         -- get all non already inserted repositories, without duplicates
         SELECT DISTINCT
@@ -78,6 +83,11 @@ BEGIN
             repo.pushed_at
         );
     END LOOP;
+
+    -- re-enable constraints
+    ALTER TABLE ONLY repositories ADD CONSTRAINT repositories_unique_clone_path UNIQUE (clone_path);
+    ALTER TABLE ONLY repositories ADD CONSTRAINT repositories_unique_clone_url UNIQUE (clone_url);
+    ALTER TABLE ONLY gh_repositories ADD CONSTRAINT gh_repositories_fk_repositories FOREIGN KEY (repository_id) REFERENCES repositories(id);
 END
 $BODY$
 LANGUAGE plpgsql;
